@@ -290,26 +290,15 @@ namespace SHMConnector {
 			}
 
             return strWriter.ToString();
-		}
-		
-		public void LogToTempFile(string message)
-		{
-			try
-			{
-				string tempPath = Path.GetTempPath();
-				string logFile = Path.Combine(tempPath, "RF2SHMConnector.log");
-				string logEntry = $"{DateTime.Now:yyyy-MM-dd HH:mm:ss.fff} - {message}{Environment.NewLine}";
-				File.AppendAllText(logFile, logEntry);
 			}
-			catch
-			{
-				// Ignore logging errors
-			}
-		}
 
-		public string ReadData()
-		{
-			StringWriter strWriter = new StringWriter();
+        private bool IsTimePlusMaxLapsSession()
+        {
+            return scoring.mScoringInfo.mEndET > 0.0 && scoring.mScoringInfo.mMaxLaps > 0;
+        }
+
+		public string ReadData() {
+            StringWriter strWriter = new StringWriter();
 
 			ref rF2VehicleScoring playerScoring = ref GetPlayerScoring(ref scoring);
 			ref rF2VehicleTelemetry playerTelemetry = ref GetPlayerTelemetry(playerScoring.mID, ref telemetry);
@@ -350,7 +339,8 @@ namespace SHMConnector {
 				strWriter.Write("CarName="); strWriter.WriteLine(vehicleName);
 				strWriter.Write("CarClass="); strWriter.WriteLine(vehicleClass);
 				strWriter.Write("Track="); strWriter.WriteLine(GetStringFromBytes(playerTelemetry.mTrackName));
-				strWriter.Write("SessionFormat="); strWriter.WriteLine((scoring.mScoringInfo.mEndET <= 0.0) ? "Laps" : "Time");
+				strWriter.Write("MixedSession="); strWriter.WriteLine(IsTimePlusMaxLapsSession() ? "true" : "false");
+				strWriter.Write("SessionFormat="); strWriter.WriteLine(IsTimePlusMaxLapsSession() || scoring.mScoringInfo.mEndET <= 0.0 ? "Laps" : "Time");
 				strWriter.Write("FuelAmount="); strWriter.WriteLine(Math.Round(playerTelemetry.mFuelCapacity));
 
 				long time = GetRemainingTime(ref playerScoring);
@@ -517,7 +507,7 @@ namespace SHMConnector {
 			if (playerScoring.mTotalLaps < 1)
 				return 0;
 
-			if (scoring.mScoringInfo.mEndET <= 0.0) {
+			if (IsTimePlusMaxLapsSession() || scoring.mScoringInfo.mEndET <= 0.0) {
 				return scoring.mScoringInfo.mMaxLaps - playerScoring.mTotalLaps;
 			}
 			else {
@@ -534,17 +524,8 @@ namespace SHMConnector {
 			if (playerScoring.mTotalLaps < 1)
 				return 0;
 
-			if (scoring.mScoringInfo.mEndET > 0.0)
+			if (!IsTimePlusMaxLapsSession() && scoring.mScoringInfo.mEndET > 0.0)
 			{
-				/*
-				long time = (long)((scoring.mScoringInfo.mEndET - (Normalize(playerScoring.mLastLapTime) * playerScoring.mTotalLaps)) * 1000);
-
-				if (time > 0)
-					return time;
-				else
-					return 0;
-				*/
-
 				return (long)Math.Max(0, scoring.mScoringInfo.mEndET - scoring.mScoringInfo.mCurrentET) * 1000;
 			}
 			else

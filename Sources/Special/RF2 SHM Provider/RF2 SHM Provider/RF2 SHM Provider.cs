@@ -266,7 +266,8 @@ namespace RF2SHMProvider {
                 Console.Write("CarName="); Console.WriteLine(vehicleName);
 				Console.Write("CarClass="); Console.WriteLine(vehicleClass);
 				Console.Write("Track="); Console.WriteLine(GetStringFromBytes(playerTelemetry.mTrackName));
-				Console.Write("SessionFormat="); Console.WriteLine((scoring.mScoringInfo.mEndET <= 0.0) ? "Laps" : "Time");
+				Console.Write("MixedSession="); Console.WriteLine(IsTimePlusMaxLapsSession() ? "true" : "false");
+				Console.Write("SessionFormat="); Console.WriteLine(IsTimePlusMaxLapsSession() || scoring.mScoringInfo.mEndET <= 0.0 ? "Laps" : "Time");
 				Console.Write("FuelAmount="); Console.WriteLine(Math.Round(playerTelemetry.mFuelCapacity));
 
 				/*
@@ -476,19 +477,24 @@ namespace RF2SHMProvider {
             return Math.Sqrt(localVel.x * localVel.x + localVel.y * localVel.y + localVel.z * localVel.z) * 3.6;
         }
 
+		private bool IsTimePlusMaxLapsSession()
+		{
+			return scoring.mScoringInfo.mEndET > 0.0 && scoring.mScoringInfo.mMaxLaps > 0;
+		}
+
 		private long GetRemainingLaps(ref rF2VehicleScoring playerScoring) {
 			if (playerScoring.mTotalLaps < 1)
 				return 0;
 
-			if (scoring.mScoringInfo.mEndET <= 0.0) {
+			if (IsTimePlusMaxLapsSession() || scoring.mScoringInfo.mEndET <= 0.0) {
 				return scoring.mScoringInfo.mMaxLaps - playerScoring.mTotalLaps;
 			}
 			else {
 				if (playerScoring.mLastLapTime > 0)
 					return (long)Math.Round(GetRemainingTime(ref playerScoring) / (Normalize(playerScoring.mLastLapTime) * 1000)) + 1;
 				else if (playerScoring.mEstimatedLapTime > 0)
-                    return (long)Math.Round(GetRemainingTime(ref playerScoring) / (Normalize(playerScoring.mEstimatedLapTime) * 1000)) + 1;
-                else
+					return (long)Math.Round(GetRemainingTime(ref playerScoring) / (Normalize(playerScoring.mEstimatedLapTime) * 1000)) + 1;
+				else
 					return 1;
 			}
 		}
@@ -497,28 +503,19 @@ namespace RF2SHMProvider {
 			if (playerScoring.mTotalLaps < 1)
 				return 0;
 
-			if (scoring.mScoringInfo.mEndET > 0.0)
+			if (!IsTimePlusMaxLapsSession() && scoring.mScoringInfo.mEndET > 0.0)
 			{
-				/*
-				long time = (long)((scoring.mScoringInfo.mEndET - (Normalize(playerScoring.mLastLapTime) * playerScoring.mTotalLaps)) * 1000);
-
-				if (time > 0)
-					return time;
-				else
-					return 0;
-				*/
-
 				return (long)Math.Max(0, scoring.mScoringInfo.mEndET - scoring.mScoringInfo.mCurrentET) * 1000;
 			}
 			else
 			{
 				if (playerScoring.mLastLapTime > 0)
-                    return (long)(GetRemainingLaps(ref playerScoring) * playerScoring.mLastLapTime * 1000);
+					return (long)(GetRemainingLaps(ref playerScoring) * playerScoring.mLastLapTime * 1000);
 				else if (playerScoring.mEstimatedLapTime > 0)
-                    return (long)(GetRemainingLaps(ref playerScoring) * playerScoring.mEstimatedLapTime * 1000);
-                else
-                    return (long)(GetRemainingLaps(ref playerScoring) * playerScoring.mBestLapTime * 1000);
-            }
+					return (long)(GetRemainingLaps(ref playerScoring) * playerScoring.mEstimatedLapTime * 1000);
+				else
+					return (long)(GetRemainingLaps(ref playerScoring) * playerScoring.mBestLapTime * 1000);
+			}
 		}
 
 		private static string GetWeather(double cloudLevel, double rainLevel) {
