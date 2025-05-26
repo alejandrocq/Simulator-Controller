@@ -53,9 +53,9 @@ namespace SHMConnector {
 
 		// Fuel cache: maps fuel liters to mChoiceIndex
 		private Dictionary<int, int> fuelLitersToChoiceIndex = new Dictionary<int, int>();
-		private volatile bool buildingCache = false;
-		private Task buildCacheTask = null;
-
+		private volatile Task buildCacheTask = null;
+		private volatile bool cacheBuildingFailed = false;
+		private bool pitMenuOpenedOnce = false;
 
 		// Fields to track last car, track, and lap for cache invalidation
 		private string lastCarName = null;
@@ -323,6 +323,12 @@ namespace SHMConnector {
 			string currentTrackName = GetStringFromBytes(playerTelemetry.mTrackName);
 			int currentLap = playerScoring.mTotalLaps;
 
+			if (!pitMenuOpenedOnce)
+			{
+				// A pit request opens the pit menu, so we can assume that the pit menu has been opened at least once
+				pitMenuOpenedOnce = playerScoring.mPitState == (byte)Request /*requested pit*/;
+			}
+
 			// Build fuel cache if not initialized or whether:
 			// - Car changed
 			// - Track changed
@@ -331,11 +337,12 @@ namespace SHMConnector {
 			bool buildCache = false;
 			if (connected
 				&& playerScoring.mInPits == 0 /*not in pitlane*/
+				&& pitMenuOpenedOnce
 				&& currentLap >= 0
 				&& currentCarName.Length != 0
 				&& currentTrackName.Length != 0)
 			{
-				buildCache = !buildingCache &&
+				buildCache = buildCacheTask == null && !cacheBuildingFailed &&
 					(fuelLitersToChoiceIndex.Count() == 0
 					|| lastCarName != currentCarName
 					|| lastTrackName != currentTrackName
@@ -344,14 +351,13 @@ namespace SHMConnector {
 				// Run this asynchronously so we don't block data reading
 				if (buildCache)
 				{
-					buildingCache = true;
 					buildCacheTask = Task.Run(() => BuildFuelCache());
 				}
-			}
 
-			lastCarName = currentCarName;
-			lastTrackName = currentTrackName;
-			lastLap = currentLap;
+				lastCarName = currentCarName;
+				lastTrackName = currentTrackName;
+				lastLap = currentLap;
+			}
 
 			string session = "";
 
@@ -538,37 +544,48 @@ namespace SHMConnector {
 
 		private void BuildFuelCache()
 		{
-			LogToTempFile("Building fuel cache...");
-
-			if (!SelectPitstopCategory("FUEL:"))
-				return;
-
-			fuelLitersToChoiceIndex.Clear();
-			MoveToFirstPitChoice();
-
-			int numChoices = pitInfo.mPitMenu.mNumChoices;
-			for (int i = 0; i < numChoices; ++i)
+			try
 			{
-				int liters = GetFuel(GetStringFromBytes(pitInfo.mPitMenu.mChoiceString));
-				int idx = pitInfo.mPitMenu.mChoiceIndex;
-				if (!fuelLitersToChoiceIndex.ContainsKey(liters))
-					fuelLitersToChoiceIndex[liters] = idx;
-				SendPitstopCommand("+");
-				pitInfoBuffer.GetMappedData(ref pitInfo);
-			}
+				LogToTempFile("Building fuel cache...");
 
-			MoveToFirstPitChoice();
-			buildingCache = false;
-			
-			LogToTempFile("Fuel cache contents: " + string.Join(", ", fuelLitersToChoiceIndex.Select(kvp => $"{kvp.Key}:{kvp.Value}")));
-        }
+				if (!SelectPitstopCategory("FUEL:"))
+					return;
+
+				fuelLitersToChoiceIndex.Clear();
+				MoveToFirstPitChoice();
+
+				int numChoices = pitInfo.mPitMenu.mNumChoices;
+				for (int i = 0; i < numChoices; ++i)
+				{
+					int liters = GetFuel(GetStringFromBytes(pitInfo.mPitMenu.mChoiceString));
+					int idx = pitInfo.mPitMenu.mChoiceIndex;
+					if (!fuelLitersToChoiceIndex.ContainsKey(liters))
+						fuelLitersToChoiceIndex[liters] = idx;
+					SendPitstopCommand("+");
+					pitInfoBuffer.GetMappedData(ref pitInfo);
+				}
+
+				MoveToFirstPitChoice();
+
+				LogToTempFile("Fuel cache contents: " + string.Join(", ", fuelLitersToChoiceIndex.Select(kvp => $"{kvp.Key}:{kvp.Value}")));
+			}
+			catch (Exception ex)
+			{
+				LogToTempFile("Error while building fuel cache: " + ex.Message);
+				cacheBuildingFailed = true;
+			}
+			finally
+			{
+				buildCacheTask = null;
+			}
+		}
 
         private void MoveToFirstPitChoice()
-        {
+		{
 			// Use numChoices to be 100% sure we are at first choice
-            SendPitstopCommand(new string('-', pitInfo.mPitMenu.mNumChoices));
-            pitInfoBuffer.GetMappedData(ref pitInfo);
-        }
+			SendPitstopCommand(new string('-', pitInfo.mPitMenu.mNumChoices));
+			pitInfoBuffer.GetMappedData(ref pitInfo);
+		}
 
         private long Normalize(long value) {
 			return (value < 0) ? 0 : value;
@@ -794,7 +811,7 @@ namespace SHMConnector {
 			MoveToFirstPitChoice();
 
 			// Use cache if available
-			if (!buildingCache && fuelLitersToChoiceIndex.TryGetValue(targetFuel, out int cachedIndex))
+			if (buildCacheTask == null && fuelLitersToChoiceIndex.TryGetValue(targetFuel, out int cachedIndex))
 			{
 				SendPitstopCommand(new string('+', cachedIndex));
 				return;
@@ -1014,7 +1031,13 @@ namespace SHMConnector {
 			if (!this.connected || this.extended.mHWControlInputEnabled == 0)
 				return;
 
-			switch (command) {
+			if (buildCacheTask != null && !buildCacheTask.IsCompleted)
+			{
+				buildCacheTask.Wait();
+			}
+
+			switch (command)
+			{
 				case "Refuel":
 					ExecuteSetRefuelCommand(arguments[0]);
 					break;
