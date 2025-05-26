@@ -53,8 +53,6 @@ namespace SHMConnector {
 
 		// Fuel cache: maps fuel liters to mChoiceIndex
 		private Dictionary<int, int> fuelLitersToChoiceIndex = new Dictionary<int, int>();
-		private volatile Task buildCacheTask = null;
-		private volatile bool cacheBuildingFailed = false;
 		private bool pitMenuOpenedOnce = false;
 
 		// Fields to track last car, track, and lap for cache invalidation
@@ -329,29 +327,23 @@ namespace SHMConnector {
 				pitMenuOpenedOnce = playerScoring.mPitState == (byte)Request /*requested pit*/;
 			}
 
-			// Build fuel cache if not initialized or whether:
-			// - Car changed
-			// - Track changed
-			// - Lap < LastLap
-			// Avoid building cache if in pitlane to avoid problems
-			bool buildCache = false;
-			if (connected
-				&& playerScoring.mInPits == 0 /*not in pitlane*/
-				&& pitMenuOpenedOnce
+            if (connected
 				&& currentLap >= 0
 				&& currentCarName.Length != 0
 				&& currentTrackName.Length != 0)
 			{
-				buildCache = buildCacheTask == null && !cacheBuildingFailed &&
-					(fuelLitersToChoiceIndex.Count() == 0
-					|| lastCarName != currentCarName
-					|| lastTrackName != currentTrackName
-					|| currentLap < lastLap);
+                // Clear fuel cache when:
+                // - Car changed
+                // - Track changed
+                // - Lap < LastLap
+                bool clearCache = lastCarName != currentCarName
+        			|| lastTrackName != currentTrackName
+        			|| currentLap < lastLap;
 
-				// Run this asynchronously so we don't block data reading
-				if (buildCache)
+				if (clearCache)
 				{
-					buildCacheTask = Task.Run(() => BuildFuelCache());
+					fuelLitersToChoiceIndex.Clear();
+					LogToTempFile($"Fuel cache cleared: Car={currentCarName}, Track={currentTrackName}, Lap={currentLap}");
 				}
 
 				lastCarName = currentCarName;
@@ -540,44 +532,6 @@ namespace SHMConnector {
 			}
 
 			return strWriter.ToString();
-		}
-
-		private void BuildFuelCache()
-		{
-			try
-			{
-				LogToTempFile("Building fuel cache...");
-
-				if (!SelectPitstopCategory("FUEL:"))
-					return;
-
-				fuelLitersToChoiceIndex.Clear();
-				MoveToFirstPitChoice();
-
-				int numChoices = pitInfo.mPitMenu.mNumChoices;
-				for (int i = 0; i < numChoices; ++i)
-				{
-					int liters = GetFuel(GetStringFromBytes(pitInfo.mPitMenu.mChoiceString));
-					int idx = pitInfo.mPitMenu.mChoiceIndex;
-					if (!fuelLitersToChoiceIndex.ContainsKey(liters))
-						fuelLitersToChoiceIndex[liters] = idx;
-					SendPitstopCommand("+");
-					pitInfoBuffer.GetMappedData(ref pitInfo);
-				}
-
-				MoveToFirstPitChoice();
-
-				LogToTempFile("Fuel cache contents: " + string.Join(", ", fuelLitersToChoiceIndex.Select(kvp => $"{kvp.Key}:{kvp.Value}")));
-			}
-			catch (Exception ex)
-			{
-				LogToTempFile("Error while building fuel cache: " + ex.Message);
-				cacheBuildingFailed = true;
-			}
-			finally
-			{
-				buildCacheTask = null;
-			}
 		}
 
         private void MoveToFirstPitChoice()
@@ -805,27 +759,47 @@ namespace SHMConnector {
 
 			int targetFuel = Int16.Parse(fuelArgument);
 
-			if (!SelectPitstopCategory("FUEL:"))
+			if (!pitMenuOpenedOnce || !SelectPitstopCategory("FUEL:"))
 				return;
 
 			MoveToFirstPitChoice();
 
 			// Use cache if available
-			if (buildCacheTask == null && fuelLitersToChoiceIndex.TryGetValue(targetFuel, out int cachedIndex))
+			if (fuelLitersToChoiceIndex.TryGetValue(targetFuel, out int cachedIndex))
 			{
 				SendPitstopCommand(new string('+', cachedIndex));
 				return;
 			}
 
 			int index = 0;
-			while (GetFuel(GetStringFromBytes(pitInfo.mPitMenu.mChoiceString)) < targetFuel && index++ < pitInfo.mPitMenu.mNumChoices)
+			int liters;
+			while ((liters = GetFuel(GetStringFromBytes(pitInfo.mPitMenu.mChoiceString))) < targetFuel && index++ < pitInfo.mPitMenu.mNumChoices)
 			{
+				int idx = pitInfo.mPitMenu.mChoiceIndex;
+				CacheFuelChoice(liters, idx);
+
 				SendPitstopCommand(new string('+', 1));
 				pitInfoBuffer.GetMappedData(ref pitInfo);
+
+				if (index >= pitInfo.mPitMenu.mNumChoices)
+				{
+					// Cache last option
+					CacheFuelChoice(GetFuel(GetStringFromBytes(pitInfo.mPitMenu.mChoiceString)), pitInfo.mPitMenu.mChoiceIndex);
+				}
 			}
 		}
 		
-		private void ExecuteChangeRefuelCommand(char action, string stepsArgument) {
+		private void CacheFuelChoice(int fuel, int choiceIndex)
+		{
+			if (!fuelLitersToChoiceIndex.ContainsKey(fuel))
+			{
+				fuelLitersToChoiceIndex[fuel] = choiceIndex;
+				LogToTempFile($"Cached fuel choice: {fuel} -> {choiceIndex}");
+			}
+		}
+		
+		private void ExecuteChangeRefuelCommand(char action, string stepsArgument)
+		{
 			if (!SelectPitstopCategory("FUEL:"))
 				return;
 
@@ -1031,11 +1005,6 @@ namespace SHMConnector {
 			if (!this.connected || this.extended.mHWControlInputEnabled == 0)
 				return;
 
-			if (buildCacheTask != null && !buildCacheTask.IsCompleted)
-			{
-				buildCacheTask.Wait();
-			}
-
 			switch (command)
 			{
 				case "Refuel":
@@ -1183,13 +1152,6 @@ namespace SHMConnector {
             StringWriter strWriter = new StringWriter();
 
             strWriter.WriteLine("[Setup Data]");
-
-			// Wait for fuel cache building to finish
-			// We need this to get consistent data here
-			if (buildCacheTask != null && !buildCacheTask.IsCompleted)
-			{
-				buildCacheTask.Wait();
-			}
 
 			if (connected)
 			{
