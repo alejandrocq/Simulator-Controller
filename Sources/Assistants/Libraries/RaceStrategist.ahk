@@ -490,28 +490,69 @@ class RaceStrategist extends GridRaceAssistant {
 			return entries
 		}
 
-		getTyreLapTimes(weather, compound, compoundColor) {
+		getTyreLapTimes(weather, compound, compoundColor, withFuel := false) {
 			local entries := []
 			local newEntries, ignore, entry, found, candidate
 
-			for ignore, entry in super.getTyreLapTimes(weather, compound, compoundColor)
+			for ignore, entry in super.getTyreLapTimes(weather, compound, compoundColor, withFuel)
 				if (entry["Lap.Time"] > 0)
 					entries.Push(entry)
 
 			if this.LapsDatabase {
 				newEntries := []
 
-				for ignore, entry in this.LapsDatabase.getTyreLapTimes(weather, compound, compoundColor) {
+				for ignore, entry in this.LapsDatabase.getTyreLapTimes(weather, compound, compoundColor, withFuel) {
 					if (entry["Lap.Time"] > 0) {
 						found := false
 
-						for ignore, candidate in entries
+						for ignore, candidate in entries {
+							; Compare by tyre laps and lap time, and fuel if withFuel is enabled
 							if ((candidate["Tyre.Laps.Front.Left"] = entry["Tyre.Laps.Front.Left"])
-							 && (candidate["Lap.Time"] = entry["Lap.Time"])) {
+							 && (candidate["Lap.Time"] = entry["Lap.Time"])
+							 && (!withFuel || (candidate["Fuel.Remaining"] = entry["Fuel.Remaining"]))) {
 								found := true
 
 								break
 							}
+						}
+
+						if !found
+							newEntries.Push(entry)
+					}
+				}
+
+				for ignore, entry in newEntries
+					entries.Push(entry)
+			}
+
+			return entries
+		}
+
+		getTyreWearLapTimes(weather, compound, compoundColor, withFuel := false) {
+			local entries := []
+			local newEntries, ignore, entry, found, candidate
+
+			for ignore, entry in super.getTyreWearLapTimes(weather, compound, compoundColor, withFuel)
+				if (entry["Lap.Time"] > 0)
+					entries.Push(entry)
+
+			if this.LapsDatabase {
+				newEntries := []
+
+				for ignore, entry in this.LapsDatabase.getTyreWearLapTimes(weather, compound, compoundColor, withFuel) {
+					if (entry["Lap.Time"] > 0) {
+						found := false
+
+						for ignore, candidate in entries {
+							; Compare by tyre wear (average) and lap time, and fuel if withFuel is enabled
+							if ((candidate["Tyre.Wear"] = entry["Tyre.Wear"])
+							 && (candidate["Lap.Time"] = entry["Lap.Time"])
+							 && (!withFuel || (candidate["Fuel.Remaining"] = entry["Fuel.Remaining"]))) {
+								found := true
+
+								break
+							}
+						}
 
 						if !found
 							newEntries.Push(entry)
@@ -909,7 +950,7 @@ class RaceStrategist extends GridRaceAssistant {
 
 	Knowledge {
 		Get {
-			static knowledge := concatenate(super.Knowledge, ["Strategy", "Pitstops"])
+			static knowledge := concatenate(super.Knowledge, ["Strategy", "Pitstops", "Performance"])
 
 			return knowledge
 		}
@@ -1501,9 +1542,178 @@ class RaceStrategist extends GridRaceAssistant {
 
 				knowledge["Pitstops"] := pitstops
 			}
+
+			if (this.activeTopic(options, "Performance") && (type = "Agent"))
+				try {
+					local weather, airTemp, trackTemp, tyreCompounds
+					local allPerformanceData, ignore, tyreCompound, compound, compoundColor
+					local performanceData
+
+					weather := knowledgeBase.getValue("Weather.Now", "Dry")
+					airTemp := knowledgeBase.getValue("Weather.Temperature.Air", 0)
+					trackTemp := knowledgeBase.getValue("Track.Temperature", 0)
+					
+					; Get all available tyre compounds for this car/track
+					tyreCompounds := SessionDatabase.getTyreCompounds(this.Simulator, this.Car, this.Track)
+					allPerformanceData := []
+
+					; Build performance data for each available compound
+					for ignore, tyreCompound in tyreCompounds {
+						compound := tyreCompound
+						compoundColor := ""
+
+						; Split compound into base and color (e.g., "Dry (Black)" -> "Dry", "Black")
+						splitCompound(tyreCompound, &compound, &compoundColor)
+
+						; Build performance data for this specific compound
+						performanceData := this.buildPerformanceKnowledge(weather, compound, compoundColor, airTemp, trackTemp)
+
+						; Only include if data is available
+						if performanceData
+							allPerformanceData.Push(performanceData)
+					}
+
+					; Add to knowledge if we have data for at least one compound
+					if (allPerformanceData.Length > 0)
+						knowledge["PerformanceData"] := allPerformanceData
+					
+				}
+				catch Any as exception {
+					logError(exception, true)
+				}
 		}
 
 		return knowledge
+	}
+
+	buildPerformanceKnowledge(weather, compound, compoundColor, airTemp, trackTemp) {
+		local lapsDB, mapData, tyreData, performanceData
+		local fuelConsumption, tyreDegradation, optimal
+		local byEngineMap, byTyreWear, ignore, entry
+		local bestLapTime, optimalTyreWear, optimalFuel, avgFuelPerLap
+
+		try {
+			lapsDB := RaceStrategist.SessionLapsDatabase(this, this.Simulator, this.Car, this.Track)
+
+			; Get map and tyre performance data from database
+			mapData := lapsDB.getMapData(weather, compound, compoundColor)
+			tyreData := lapsDB.getTyreWearLapTimes(weather, compound, compoundColor, true)  ; withFuel := true to include fuel data
+
+			; Return false if insufficient data
+			if (!mapData || (mapData.Length = 0) || !tyreData || (tyreData.Length = 0))
+				return false
+
+			; Build the PerformanceData structure according to Option 1
+			performanceData := Map()
+			performanceData["Weather"] := weather
+			performanceData["TyreCompound"] := compound . " (" . compoundColor . ")"
+			performanceData["AirTemperature"] := Round(airTemp, 1)
+			performanceData["TrackTemperature"] := Round(trackTemp, 1)
+
+			; Build FuelConsumption section
+			fuelConsumption := Map()
+			avgFuelPerLap := 0
+			byEngineMap := []
+
+			for ignore, entry in mapData {
+				byEngineMap.Push(Map("Map", entry["Map"]
+								   , "FuelPerLap", Round(entry["Fuel.Consumption"], 2)
+								   , "AverageLapTime", Round(entry["Lap.Time"], 2)))
+
+				avgFuelPerLap += entry["Fuel.Consumption"]
+			}
+
+			if (mapData.Length > 0)
+				avgFuelPerLap := Round(avgFuelPerLap / mapData.Length, 2)
+
+			fuelConsumption["AveragePerLap"] := avgFuelPerLap
+			fuelConsumption["ByEngineMap"] := byEngineMap
+			performanceData["FuelConsumption"] := fuelConsumption
+
+			; Build TyreDegradation section
+			tyreDegradation := Map()
+			byTyreWear := []
+			bestLapTime := 9999
+			optimalTyreWear := 0
+			optimalFuel := 0
+
+			for ignore, entry in tyreData {
+				local tyreWear := Round(entry["Tyre.Wear"], 1)
+				local lapTime := Round(entry["Lap.Time"], 2)
+				local fuelRemaining := Round(entry.Has("Fuel.Remaining") ? entry["Fuel.Remaining"] : 0, 1)
+
+				byTyreWear.Push(Map("TyreWear", tyreWear
+								  , "BestLapTime", lapTime
+								  , "FuelRemaining", fuelRemaining))
+
+				; Track optimal conditions (fastest lap)
+				if (lapTime < bestLapTime) {
+					bestLapTime := lapTime
+					optimalTyreWear := tyreWear
+					optimalFuel := fuelRemaining
+				}
+			}
+
+			tyreDegradation["Compound"] := compound . " (" . compoundColor . ")"
+			tyreDegradation["ByTyreWear"] := byTyreWear
+			performanceData["TyreDegradation"] := tyreDegradation
+
+			; Build OptimalConditions section
+			optimal := Map()
+			optimal["BestLapTime"] := bestLapTime
+			optimal["TyreWear"] := optimalTyreWear
+			optimal["FuelLoad"] := optimalFuel
+
+			; Try to get pressure and temperature data if available
+			try {
+				local tyreEntries := lapsDB.getTyreEntries(weather, compound, compoundColor)
+
+				if (tyreEntries && (tyreEntries.Length > 0)) {
+					; Find entry closest to optimal conditions
+					local bestEntry := false
+					local minDiff := 9999
+
+					for ignore, entry in tyreEntries {
+						if (entry.Has("Lap.Time") && entry.Has("Tyre.Laps.Front.Left")) {
+							local diff := Abs(entry["Lap.Time"] - bestLapTime)
+
+							if (diff < minDiff) {
+								minDiff := diff
+								bestEntry := entry
+							}
+						}
+					}
+
+					if bestEntry {
+						if (bestEntry.Has("Tyre.Pressure.Front.Left")) {
+							optimal["TyrePressure"] := Map("FL", Round(bestEntry["Tyre.Pressure.Front.Left"], 1)
+														 , "FR", Round(bestEntry["Tyre.Pressure.Front.Right"], 1)
+														 , "RL", Round(bestEntry["Tyre.Pressure.Rear.Left"], 1)
+														 , "RR", Round(bestEntry["Tyre.Pressure.Rear.Right"], 1))
+						}
+
+						if (bestEntry.Has("Tyre.Temperature.Front.Left")) {
+							optimal["TyreTemperature"] := Map("FL", Round(bestEntry["Tyre.Temperature.Front.Left"])
+															 , "FR", Round(bestEntry["Tyre.Temperature.Front.Right"])
+															 , "RL", Round(bestEntry["Tyre.Temperature.Rear.Left"])
+															 , "RR", Round(bestEntry["Tyre.Temperature.Rear.Right"]))
+						}
+					}
+				}
+			}
+			catch Any as exception {
+				; Pressure/temperature data optional, continue without it
+				logError(exception, true)
+			}
+
+			performanceData["OptimalConditions"] := optimal
+
+			return performanceData
+		}
+		catch Any as exception {
+			logError(exception, true)
+			return false
+		}
 	}
 
 	requestInformation(category, arguments*) {
@@ -2771,7 +2981,7 @@ class RaceStrategist extends GridRaceAssistant {
 	}
 
 	createSessionKnowledge(lapNumber) {
-		return this.getKnowledge("Agent", {include: ["Session", "Strategy"]})
+		return this.getKnowledge("Agent", {include: ["Session", "Strategy", "Performance"]})
 	}
 
 	reportStrategy(options := true, strategy := false) {

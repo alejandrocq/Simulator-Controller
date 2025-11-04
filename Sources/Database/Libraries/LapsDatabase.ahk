@@ -334,6 +334,17 @@ class LapsDatabase extends SessionDatabase {
 										  , drivers)
 	}
 
+	getTyreWearLapTimes(weather, compound, compoundColor, withFuel := false, drivers := kUndefined) {
+		local rows
+
+		this.combineCompounds(&compound, &compoundColor)
+
+		return this.combineResults("Tyres", {Group: [["Lap.Time", minimum, "Lap.Time"]], By: (withFuel ? ["Tyre.Wear", "Fuel.Remaining"] : "Tyre.Wear")
+										   , Transform: compose(removeInvalidLaps, computeWear)
+										   , Where: Map("Weather", weather, "Tyre.Compound", compound, "Tyre.Compound.Color", compoundColor)}
+										  , drivers)
+	}
+
 	getFuelLapTimes(weather, compound, compoundColor, drivers := kUndefined) {
 		this.combineCompounds(&compound, &compoundColor)
 
