@@ -41,6 +41,7 @@
 #Include "..\Framework\Extensions\CodeEditor.ahk"
 #Include "..\Framework\Extensions\ScriptEngine.ahk"
 #Include "..\Framework\Extensions\RuleEngine.ahk"
+#Include "..\Framework\Extensions\LLMConnector.ahk"
 #Include "..\Database\Libraries\SessionDatabase.ahk"
 #Include "..\Database\Libraries\SessionDatabaseBrowser.ahk"
 #Include "..\Database\Libraries\SettingsDatabase.ahk"
@@ -1223,7 +1224,7 @@ class StrategyWorkbench extends ConfigurationItem {
 
 		workbenchGui.Add("DropDownList", "x435 yp w180 Choose1 +0x200 VsimulationMenuDropDown", collect(["Simulation", "---------------------------------------------", "Run Simulation", "---------------------------------------------", "Use as Strategy..."], translate)).OnEvent("Change", simulationMenu)
 
-		workbenchGui.Add("DropDownList", "x620 yp w180 Choose1 +0x200 VstrategyMenuDropDown", collect(["Strategy", "---------------------------------------------", "Load current Race Strategy", "Load Strategy...", "Save Strategy...", "---------------------------------------------", "Compare Strategies...", "---------------------------------------------", "Set as Race Strategy", "Clear Race Strategy"], translate)).OnEvent("Change", strategyMenu)
+		workbenchGui.Add("DropDownList", "x620 yp w180 Choose1 +0x200 VstrategyMenuDropDown", collect(["Strategy", "---------------------------------------------", "Load current Race Strategy", "Load Strategy...", "Save Strategy...", "---------------------------------------------", "AI Strategy from Laps...", "---------------------------------------------", "Compare Strategies...", "---------------------------------------------", "Set as Race Strategy", "Clear Race Strategy"], translate)).OnEvent("Change", strategyMenu)
 
 		workbenchGui.SetFont("Norm", "Arial")
 		workbenchGui.SetFont("Italic", "Arial")
@@ -3526,7 +3527,9 @@ class StrategyWorkbench extends ConfigurationItem {
 					withBlockedWindows(MsgDlg, translate("There is no current Strategy."), translate("Information"), 262192)
 					OnMessage(0x44, translateOkButton, 0)
 				}
-			case 7: ; "Compare Strategies..."
+			case 7: ; "AI Strategy from Laps..."
+				this.generateAIStrategy()
+			case 9: ; "Compare Strategies..."
 				this.Window.Opt("+OwnDialogs")
 
 				translator := translateMsgDlgButtons.Bind(["Compare", "Cancel"])
@@ -3544,7 +3547,7 @@ class StrategyWorkbench extends ConfigurationItem {
 					if (strategies.Length > 1)
 						this.compareStrategies(strategies*)
 				}
-			case 9: ; "Export Strategy..."
+			case 11: ; "Set as Race Strategy..."
 				if this.SelectedStrategy {
 					configuration := newMultiMap()
 
@@ -3557,7 +3560,7 @@ class StrategyWorkbench extends ConfigurationItem {
 					withBlockedWindows(MsgDlg, translate("There is no current Strategy."), translate("Information"), 262192)
 					OnMessage(0x44, translateOkButton, 0)
 				}
-			case 10: ; "Clear Strategy..."
+			case 12: ; "Clear Race Strategy..."
 				deleteFile(kUserConfigDirectory . "Race.strategy")
 		}
 	}
@@ -3737,6 +3740,269 @@ class StrategyWorkbench extends ConfigurationItem {
 		html := ("<html>" . before . chart . charts . ";`n" . drawChartsFunction . after . "<body style='background-color: #" . this.Window.AltBackColor . "' style='overflow: auto' leftmargin='0' topmargin='0' rightmargin='0' bottommargin='0'><style> div, table { font-family: Arial, Helvetica, sans-serif; font-size: 11px }</style><style>" . tableCSS . "</style><style> #header { font-size: 12px; } table, p, div { color: #" . this.Window.Theme.TextColor . " } </style>" . html . "<br><hr style=`"width: 50%`"><br>" . chartArea . "</body></html>")
 
 		this.showComparisonChart(html)
+	}
+
+	class SimpleLLMManager {
+		iConfiguration := false
+
+		Configuration {
+			Get {
+				return this.iConfiguration
+			}
+		}
+
+		__New(configuration) {
+			this.iConfiguration := configuration
+		}
+
+		getInstructions() {
+			return []
+		}
+
+		getTools(type := false) {
+			return []
+		}
+
+		connectorState(state := false, type := false, info := false) {
+			; Handle connector state changes (Active, Error, etc.)
+			; This is a stub implementation - just log if there's an error
+			if (state = "Error") {
+				if isDebug()
+					logMessage(kLogWarn, "LLM Connector Error - Type: " . type . ", Info: " . (info ? info : "N/A"))
+			}
+		}
+	}
+
+	generateAIStrategy() {
+		local simulator := this.SelectedSimulator
+		local car := this.SelectedCar
+		local track := this.SelectedTrack
+		local lapsDB, prompt, service, model, connector, response, manager
+		local tyreEntries, ignore, entry, dataJSON, filteredEntry, field
+		local validator, pitstopRule, pitstopWindow, refuelRule, tyreChangeRule, tyreSets
+		local stintLength, formationLap, postRaceLap, fuelCapacity, safetyFuel
+		local pitstopDelta, pitstopFuelService, pitstopTyreService, pitstopServiceOrder
+		local sessionType, sessionLength, rules, settings
+
+		if (!simulator || !car || !track) {
+			OnMessage(0x44, translateOkButton)
+			withBlockedWindows(MsgBox, translate("Please select a Simulator, Car, and Track first."), translate("Warning"), 262192)
+			OnMessage(0x44, translateOkButton, 0)
+			return
+		}
+
+		try {
+			; Get Rules & Settings FIRST (before blocking the window)
+			this.getPitstopRules(&validator, &pitstopRule, &pitstopWindow, &refuelRule, &tyreChangeRule, &tyreSets)
+			this.getSessionSettings(&stintLength, &formationLap, &postRaceLap, &fuelCapacity, &safetyFuel
+								  , &pitstopDelta, &pitstopFuelService, &pitstopTyreService, &pitstopServiceOrder)
+
+			; Get session type and length
+			sessionType := this.SelectedSessionType
+			sessionLength := this.Control["sessionLengthEdit"].Text
+
+			; Now block the window before doing intensive operations
+			this.Window.Block()
+
+			; Get laps database
+			lapsDB := LapsDatabase(simulator, car, track, this.SelectedDrivers)
+
+			; Extract laps data for ALL compounds
+			tyreEntries := []
+
+			for ignore, compoundSpec in this.AvailableCompounds {
+				local compoundName, compoundColor, tempTyreEntries
+
+				splitCompound(compoundSpec, &compoundName, &compoundColor)
+
+				; Get tyre data for this compound
+				tempTyreEntries := lapsDB.getTyreEntries(this.SelectedWeather, compoundName, compoundColor, this.SelectedDrivers)
+				for ignore, entry in tempTyreEntries
+					tyreEntries.Push(entry)
+			}
+
+			if (tyreEntries.Length = 0) {
+				OnMessage(0x44, translateOkButton)
+				withBlockedWindows(MsgBox, translate("No laps data available for the selected conditions."), translate("Information"), 262192)
+				OnMessage(0x44, translateOkButton, 0)
+				return
+			}
+
+			; Build rules and settings objects
+			rules := Map()
+			rules["sessionType"] := sessionType
+			rules["sessionLength"] := sessionLength . (sessionType = "Duration" ? " minutes" : " laps")
+			rules["additionalLaps"] := this.SelectedAdditionalLaps
+			rules["formationLap"] := formationLap ? "Yes" : "No"
+			rules["postRaceLap"] := postRaceLap ? "Yes" : "No"
+			rules["pitstopRule"] := pitstopRule ? pitstopRule . " pitstops" : "Variable"
+			rules["pitstopWindow"] := pitstopWindow ? pitstopWindow[1] . "-" . pitstopWindow[2] : "No window"
+			rules["refuelRequirement"] := refuelRule
+			rules["tyreChangeRequirement"] := tyreChangeRule
+			rules["validator"] := validator ? validator : "None"
+
+			if (tyreSets.Length > 0) {
+				rules["tyreSets"] := []
+				for ignore, tyreSet in tyreSets
+					rules["tyreSets"].Push(Map("compound", tyreSet[1], "compoundColor", tyreSet[2], "count", tyreSet[3], "maxLaps", tyreSet[4]))
+			}
+
+			settings := Map()
+			settings["fuelCapacity"] := fuelCapacity . " liters"
+			settings["safetyFuel"] := safetyFuel . " liters"
+			settings["pitstopDelta"] := pitstopDelta . " seconds"
+			settings["pitstopFuelService"] := pitstopFuelService[1] . " (" . pitstopFuelService[2] . " liters/sec)"
+			settings["pitstopTyreService"] := pitstopTyreService . " seconds"
+			settings["pitstopServiceOrder"] := pitstopServiceOrder
+
+			; Format data as JSON and filter out unwanted fields
+			dataJSON := Map()
+			dataJSON["simulator"] := simulator
+			dataJSON["car"] := car
+			dataJSON["track"] := track
+			dataJSON["weather"] := this.SelectedWeather
+			dataJSON["airTemperature"] := this.AirTemperature
+			dataJSON["trackTemperature"] := this.TrackTemperature
+			dataJSON["rules"] := rules
+			dataJSON["settings"] := settings
+			dataJSON["lapsData"] := []
+
+			; Filter tyre entries (remove Tyre.Laps.*, pressures, Identifier, Synchronized)
+			for ignore, entry in tyreEntries {
+				filteredEntry := Map()
+				for field, value in entry
+					if (field != "Tyre.Laps"
+					 && field != "Tyre.Laps.Front.Left" && field != "Tyre.Laps.Front.Right"
+					 && field != "Tyre.Laps.Rear.Left" && field != "Tyre.Laps.Rear.Right"
+					 && field != "Tyre.Pressure.Front.Left" && field != "Tyre.Pressure.Front.Right"
+					 && field != "Tyre.Pressure.Rear.Left" && field != "Tyre.Pressure.Rear.Right"
+					 && field != "Identifier" && field != "Synchronized")
+						filteredEntry[field] := value
+
+				dataJSON["lapsData"].Push(filteredEntry)
+			}
+
+			; Create enhanced prompt for LLM
+			prompt := "You are a professional race strategist preparing a pre-race strategy for an upcoming race session.`n`n"
+			prompt .= "TASK: Create a detailed race strategy including:`n"
+			prompt .= "- Number and timing of pitstops`n"
+			prompt .= "- Fuel amounts for each stint`n"
+			prompt .= "- Tyre compound choices and when to change them`n"
+			prompt .= "- Reasoning based on the historical lap data patterns`n`n"
+			prompt .= "IMPORTANT CONTEXT:`n"
+			prompt .= "- This is PRE-RACE planning, not real-time race management`n"
+			prompt .= "- The historical laps data shows past performance at this track/car combination`n"
+			prompt .= "- Use the data to identify optimal lap times, fuel consumption rates, and tyre degradation patterns`n"
+			prompt .= "- Consider the race rules and technical settings provided`n`n"
+			prompt .= "DATA PROVIDED:`n" . JSON.print(dataJSON, "  ")
+
+			; Get LLM configuration from Race Strategist settings
+			service := getMultiMapValue(this.Configuration, "Agent Booster", "Race Strategist.Service", false)
+			model := getMultiMapValue(this.Configuration, "Agent Booster", "Race Strategist.Model", false)
+
+			if (!service || !model) {
+				OnMessage(0x44, translateOkButton)
+				withBlockedWindows(MsgBox, translate("LLM service not configured for Race Strategist. Please configure it in the settings."), translate("Error"), 262192)
+				OnMessage(0x44, translateOkButton, 0)
+				return
+			}
+
+			; Create simple manager for LLM connector
+			manager := StrategyWorkbench.SimpleLLMManager(this.Configuration)
+
+			; Parse service configuration (Provider|ServerURL|APIToken)
+			service := string2Values("|", service, 3)
+
+			; Create LLM connector
+			if (service[1] = "LLM Runtime")
+				connector := LLMConnector.LLMRuntimeConnector(manager, model, getMultiMapValue(this.Configuration, "Agent Booster", "Race Strategist.GPULayers", 0))
+			else {
+				try {
+					connector := LLMConnector.%StrReplace(service[1], A_Space, "")%Connector(manager, model)
+
+					; Connect with server URL and API token
+					connector.Connect(service[2], service[3])
+				}
+				catch Any as exception {
+					logError(exception)
+
+					OnMessage(0x44, translateOkButton)
+					withBlockedWindows(MsgBox, translate("Failed to create LLM connector. Please check your Race Strategist LLM configuration."), translate("Error"), 262192)
+					OnMessage(0x44, translateOkButton, 0)
+					return
+				}
+			}
+
+			connector.MaxTokens := getMultiMapValue(this.Configuration, "Agent Booster", "Race Strategist.MaxTokens", 2048)
+			connector.Temperature := 0.5
+
+			; Call LLM
+			response := connector.Ask(prompt, false, false)
+
+			if response {
+				; Display the response to the user in a scrollable window
+				this.showAIStrategyResponse(prompt, response)
+			}
+			else {
+				OnMessage(0x44, translateOkButton)
+				withBlockedWindows(MsgBox, translate("Failed to get response from LLM."), translate("Error"), 262192)
+				OnMessage(0x44, translateOkButton, 0)
+			}
+		}
+		catch Any as exception {
+			logError(exception)
+
+			OnMessage(0x44, translateOkButton)
+			withBlockedWindows(MsgBox, translate("Error generating AI strategy: ") . exception.Message, translate("Error"), 262192)
+			OnMessage(0x44, translateOkButton, 0)
+		}
+		finally {
+			this.Window.Unblock()
+		}
+	}
+
+	showAIStrategyResponse(prompt, response) {
+		local responseGui, responseTab, promptEdit, responseEdit, x, y, width, height
+		local mainScreenTop, mainScreenLeft, mainScreenRight, mainScreenBottom
+
+		; Get screen dimensions
+		MonitorGetWorkArea(, &mainScreenLeft, &mainScreenTop, &mainScreenRight, &mainScreenBottom)
+
+		; Calculate window size (80% of screen width/height, max 1000x700)
+		width := Min(Round((mainScreenRight - mainScreenLeft) * 0.8), 1000)
+		height := Min(Round((mainScreenBottom - mainScreenTop) * 0.8), 700)
+
+		; Center on screen
+		x := mainScreenLeft + Round((mainScreenRight - mainScreenLeft - width) / 2)
+		y := mainScreenTop + Round((mainScreenBottom - mainScreenTop - height) / 2)
+
+		; Create the window
+		responseGui := Window({Descriptor: "AI Strategy Response", Options: "Owner" . this.Window.Hwnd})
+
+		responseGui.SetFont("s10", "Arial")
+		responseGui.Add("Text", "x16 y16 w" . (width - 32), translate("AI Strategy Analysis:"))
+
+		; Create tab control for Prompt and Response
+		responseGui.SetFont("s9", "Arial")
+		responseTab := responseGui.Add("Tab3", "x16 y40 w" . (width - 32) . " h" . (height - 100), collect([translate("Response"), translate("Prompt Sent")], translate))
+
+		; Response tab
+		responseTab.UseTab(1)
+		responseGui.SetFont("s9", "Consolas")
+		responseEdit := responseGui.Add("Edit", "x24 y72 w" . (width - 48) . " h" . (height - 140) . " ReadOnly VScroll +0x100000", response)
+
+		; Prompt tab
+		responseTab.UseTab(2)
+		responseGui.SetFont("s9", "Consolas")
+		promptEdit := responseGui.Add("Edit", "x24 y72 w" . (width - 48) . " h" . (height - 140) . " ReadOnly VScroll +0x100000", prompt)
+
+		responseTab.UseTab()
+
+		; Close button
+		responseGui.SetFont("s10", "Arial")
+		responseGui.Add("Button", "x" . Round((width - 100) / 2) . " y" . (height - 45) . " w100 h30 Default", translate("Close")).OnEvent("Click", (*) => responseGui.Destroy())
+
+		responseGui.Show("x" . x . " y" . y . " w" . width . " h" . height)
 	}
 
 	createStrategy(nameOrConfiguration, driver := false) {
